@@ -1,24 +1,179 @@
-This is free and unencumbered software released into the public domain.
+import 'dotenv/config';
+import { GoogleGenAI } from '@google/genai';
+import {
+  ChannelType,
+  Client,
+  Events,
+  GatewayIntentBits,
+  Partials,
+} from 'discord.js';
 
-Anyone is free to copy, modify, publish, use, compile, sell, or
-distribute this software, either in source code form or as a compiled
-binary, for any purpose, commercial or non-commercial, and by any
-means.
+// 1. Configuration (reads from Environment Variables / Secrets)
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN?.trim();
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
+const COMMAND_PREFIX = '!';
+const MODEL = 'gemini-3.1-flash-lite';
+const SYSTEM_INSTRUCTION =
+  'You are a helpful, friendly Discord bot. Keep your answers concise and well-formatted for Discord markdown.';
+const MAX_DISCORD_LENGTH = 2000;
 
-In jurisdictions that recognize copyright laws, the author or authors
-of this software dedicate any and all copyright interest in the
-software to the public domain. We make this dedication for the benefit
-of the public at large and to the detriment of our heirs and
-successors. We intend this dedication to be an overt act of
-relinquishment in perpetuity of all present and future rights to this
-software under copyright law.
+if (!DISCORD_TOKEN) {
+  throw new Error('Missing DISCORD_TOKEN environment variable.');
+}
+if (!GEMINI_API_KEY) {
+  throw new Error('Missing GEMINI_API_KEY environment variable.');
+}
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
-ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
-OTHER DEALINGS IN THE SOFTWARE.
+// Initialize the Gemini Client
+const aiClient = new GoogleGenAI({
+  apiKey: GEMINI_API_KEY,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  },
+});
 
-For more information, please refer to <https://unlicense.org>
+// 2. Setup Discord Bot with Required Intents & DM Partials
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel, Partials.Message],
+});
+
+// 3. Per-User In-Memory Chat History Tracker
+const chatSessions = new Map();
+
+function getOrCreateChat(userId) {
+  if (!chatSessions.has(userId)) {
+    const chat = aiClient.chats.create({
+      model: MODEL,
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+      },
+    });
+    chatSessions.set(userId, chat);
+  }
+  return chatSessions.get(userId);
+}
+
+// Split messages cleanly under Discord's 2,000-character limit
+function splitForDiscord(text) {
+  const normalized = (text || '').trim() || '(Empty response)';
+  if (normalized.length <= MAX_DISCORD_LENGTH) {
+    return [normalized];
+  }
+
+  const chunks = [];
+  let remaining = normalized;
+  while (remaining.length > MAX_DISCORD_LENGTH) {
+    const slice = remaining.slice(0, MAX_DISCORD_LENGTH);
+    let splitIdx = slice.lastIndexOf('\n');
+    if (splitIdx < MAX_DISCORD_LENGTH * 0.5) {
+      splitIdx = slice.lastIndexOf(' ');
+    }
+    if (splitIdx < MAX_DISCORD_LENGTH * 0.4) {
+      splitIdx = MAX_DISCORD_LENGTH;
+    }
+    const piece = remaining.slice(0, splitIdx).trimEnd();
+    chunks.push(piece.length > 0 ? piece : remaining.slice(0, MAX_DISCORD_LENGTH));
+    remaining = remaining.slice(splitIdx).trimStart();
+  }
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+  return chunks;
+}
+
+// 4. Bot Events
+client.once(Events.ClientReady, (readyClient) => {
+  console.log(
+    `Logged in successfully as ${readyClient.user.tag} (ID: ${readyClient.user.id})`
+  );
+  console.log('Bot is ready to receive DM conversations!');
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || message.author.id === client.user?.id) return;
+  if (message.channel.type !== ChannelType.DM) return;
+
+  if (message.channel.partial) {
+    try {
+      await message.channel.fetch();
+    } catch {
+      return;
+    }
+  }
+
+  const channel = message.channel;
+  if (!channel.isSendable()) return;
+
+  const content = (message.content || '').trim();
+  if (!content) {
+    await channel.send('Please send a text message so I can reply to you.');
+    return;
+  }
+
+  // Handle built-in prefix commands (!help, !ping, !reset)
+  if (content.startsWith(COMMAND_PREFIX)) {
+    const command = content.slice(COMMAND_PREFIX.length).trim().split(/\s+/)[0]?.toLowerCase();
+    if (command === 'ping') {
+      await channel.send(
+        `Pong! Gateway latency: **${Math.max(0, Math.round(client.ws.ping))}ms** · Active model: \`${MODEL}\``
+      );
+      return;
+    }
+    if (command === 'reset' || command === 'clear') {
+      chatSessions.delete(message.author.id);
+      await channel.send(
+        'Conversation memory cleared. Send your next message to start a fresh chat session.'
+      );
+      return;
+    }
+    if (command === 'help') {
+      await channel.send(
+        [
+          `**Discord Bot Commands** (Prefix \`${COMMAND_PREFIX}\`)`,
+          `• \`${COMMAND_PREFIX}help\` — Show available commands`,
+          `• \`${COMMAND_PREFIX}ping\` — Check gateway latency and active Gemini model`,
+          `• \`${COMMAND_PREFIX}reset\` — Clear your in-memory Gemini chat history`,
+          '',
+          'Send any message without a command prefix to chat directly with Gemini.',
+        ].join('\n')
+      );
+      return;
+    }
+  }
+
+  let typingTimer = null;
+  try {
+    await channel.sendTyping();
+    typingTimer = setInterval(() => {
+      void channel.sendTyping().catch(() => {});
+    }, 8000);
+
+    const userChat = getOrCreateChat(message.author.id);
+    const response = await userChat.sendMessage({ message: content });
+    const chunks = splitForDiscord(response.text);
+
+    for (const chunk of chunks) {
+      await channel.send(chunk);
+    }
+  } catch (err) {
+    console.error(`Error handling DM from ${message.author.username}:`, err);
+    await channel.send(
+      '⚠️ Sorry, I ran into an error trying to process that request.'
+    );
+  } finally {
+    if (typingTimer) {
+      clearInterval(typingTimer);
+    }
+  }
+});
+
+// 5. Launch Bot
+client.login(DISCORD_TOKEN);
